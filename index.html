@@ -1,0 +1,1680 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  onAuthStateChanged,
+  signInWithCustomToken
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  addDoc, 
+  collection, 
+  onSnapshot, 
+  query,
+  updateDoc,
+  deleteDoc,
+  orderBy
+} from 'firebase/firestore';
+import { setLogLevel } from 'firebase/firestore';
+import { 
+  getStorage, 
+  ref, 
+  uploadBytes, 
+  getDownloadURL 
+} from "firebase/storage";
+
+// --- Firebase Configuration ---
+const firebaseConfig = typeof __firebase_config !== 'undefined'
+  ? JSON.parse(__firebase_config)
+  : {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_AUTH_DOMAIN",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_STORAGE_BUCKET",
+      messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+    
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Initialize Firebase ---
+let app;
+let db;
+let auth;
+let storage;
+try {
+  app = initializeApp(firebaseConfig);
+  db = getFirestore(app);
+  auth = getAuth(app);
+  storage = getStorage(app);
+  setLogLevel('debug');
+} catch (e) {
+  console.error("Firebase initialization error", e);
+}
+
+// --- Auth Hook ---
+const useAuth = () => {
+  const [user, setUser] = useState(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+
+  useEffect(() => {
+    if (!auth) {
+      setIsAuthLoading(false);
+      return;
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        setUser(currentUser);
+        setIsAuthLoading(false);
+      } else {
+        try {
+          if (typeof __initial_auth_token !== 'undefined') {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Auth Error:", error);
+          setIsAuthLoading(false);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  return { user, isAuthLoading };
+};
+
+// --- Firestore Hook ---
+const useLeagues = (isAuthReady) => {
+  const [leagues, setLeagues] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    // Wait for auth to be ready before querying
+    if (!isAuthReady) {
+      setIsLoading(true);
+      return;
+    }
+
+    if (!db) {
+      setIsLoading(false);
+      setError("Firestore is not initialized.");
+      return;
+    }
+
+    setIsLoading(true);
+    const leaguesCollectionPath = `artifacts/${appId}/public/data/leagues`;
+    const q = query(collection(db, leaguesCollectionPath));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const leaguesData = [];
+      snapshot.forEach(doc => {
+        leaguesData.push({ id: doc.id, ...doc.data() });
+      });
+      setLeagues(leaguesData);
+      setIsLoading(false);
+    }, (err) => {
+      console.error("Error fetching leagues:", err);
+      setError("Failed to fetch leagues. Check console for details.");
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady]);
+
+  return { leagues, isLoading, error };
+};
+
+// --- Helper Functions ---
+
+/**
+ * Generates a consistent, vibrant color for a string.
+ * @param {string} str - The input string (e.g., team name).
+ * @param {string} type - 'darkBg' for light text on dark, 'lightBg' for dark text on light.
+ * @returns {string} An HSL color string.
+ */
+const generateColorForString = (str, type = 'darkBg') => {
+  let hash = 0;
+  if (!str || str.length === 0) {
+    return type === 'darkBg' ? 'hsl(0, 0%, 90%)' : 'hsl(0, 0%, 20%)';
+  }
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  const hue = Math.abs(hash % 360);
+  
+  if (type === 'darkBg') {
+    // Vibrant, light color for dark backgrounds
+    return `hsl(${hue}, 70%, 75%)`;
+  } else {
+    // Darker, saturated color for light backgrounds
+    return `hsl(${hue}, 60%, 40%)`;
+  }
+};
+
+
+const calculateLeagueTable = (teams, fixtures) => {
+  const table = teams.map(teamName => ({
+    name: teamName,
+    P: 0, W: 0, D: 0, L: 0,
+    GF: 0, GA: 0, GD: 0, Pts: 0,
+  }));
+
+  const findTeam = (name) => table.find(t => t.name === name);
+
+  fixtures.forEach(fixture => {
+    if (fixture.status !== 'completed') return;
+
+    const homeTeam = findTeam(fixture.home);
+    const awayTeam = findTeam(fixture.away);
+    const homeScore = parseInt(fixture.homeScore, 10);
+    const awayScore = parseInt(fixture.awayScore, 10);
+
+    if (homeTeam) {
+      homeTeam.P++;
+      homeTeam.GF += homeScore;
+      homeTeam.GA += awayScore;
+      homeTeam.GD = homeTeam.GF - homeTeam.GA;
+    }
+    if (awayTeam) {
+      awayTeam.P++;
+      awayTeam.GF += awayScore;
+      awayTeam.GA += homeScore;
+      awayTeam.GD = awayTeam.GF - awayTeam.GA;
+    }
+
+    if (homeScore > awayScore) {
+      if (homeTeam) { homeTeam.W++; homeTeam.Pts += 3; }
+      if (awayTeam) { awayTeam.L++; }
+    } else if (homeScore < awayScore) {
+      if (homeTeam) { homeTeam.L++; }
+      if (awayTeam) { awayTeam.W++; awayTeam.Pts += 3; }
+    } else {
+      if (homeTeam) { homeTeam.D++; homeTeam.Pts += 1; }
+      if (awayTeam) { awayTeam.D++; awayTeam.Pts += 1; }
+    }
+  });
+
+  table.sort((a, b) => {
+    if (a.Pts !== b.Pts) return b.Pts - a.Pts;
+    if (a.GD !== b.GD) return b.GD - a.GD;
+    if (a.GF !== b.GF) return b.GF - a.GF;
+    return a.name.localeCompare(b.name);
+  });
+
+  return table;
+};
+
+const generateFixtures = (teams) => {
+  const fixtures = [];
+  if (teams.length < 2) return fixtures;
+
+  for (let i = 0; i < teams.length; i++) {
+    for (let j = i + 1; j < teams.length; j++) {
+      // Each team plays each other once
+      fixtures.push({
+        home: teams[i],
+        away: teams[j],
+        status: 'pending',
+        label: '', // Add label field
+        condition: 'Excellent', // Add condition field
+      });
+    }
+  }
+  
+  // Simple shuffle
+  for (let i = fixtures.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [fixtures[i], fixtures[j]] = [fixtures[j], fixtures[i]];
+  }
+
+  return fixtures;
+};
+
+// --- UI Components ---
+const Button = ({ onClick, children, className = '', disabled = false, type = 'button', variant = 'primary' }) => {
+  const baseStyle = "w-full py-3 px-6 font-bold text-white rounded-lg transition-all duration-300 ease-in-out focus:outline-none focus:ring-4 focus:ring-opacity-50";
+  
+  let colorStyle = "";
+  switch (variant) {
+    case 'danger':
+      colorStyle = "bg-red-600 hover:bg-red-700 focus:ring-red-400";
+      break;
+    case 'secondary':
+      colorStyle = "bg-gray-600 hover:bg-gray-700 focus:ring-gray-400";
+      break;
+    case 'primary':
+    default:
+      colorStyle = "bg-blue-600 hover:bg-blue-700 focus:ring-blue-400";
+  }
+  
+  const disabledStyle = "bg-gray-500 cursor-not-allowed";
+
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={`${baseStyle} ${disabled ? disabledStyle : colorStyle} ${className}`}
+    >
+      {children}
+    </button>
+  );
+};
+
+const Input = ({ value, onChange, placeholder, type = 'text' }) => (
+  <input
+    type={type}
+    value={value}
+    onChange={onChange}
+    placeholder={placeholder}
+    className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all bg-white text-gray-900 placeholder-gray-500"
+  />
+);
+
+const Modal = ({ isOpen, onClose, title, children, hideCloseButton = false }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div 
+      className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4"
+      onClick={!hideCloseButton ? onClose : () => {}}
+    >
+      <div 
+        className="bg-white rounded-lg shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center p-6 border-b border-gray-200">
+          <h3 className="text-2xl font-bold text-gray-900">{title}</h3>
+          {!hideCloseButton && (
+            <button 
+              onClick={onClose}
+              className="text-gray-400 hover:text-gray-600 transition-all"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          )}
+        </div>
+        <div className="p-6 space-y-6 overflow-y-auto">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Confirmation Modal
+ */
+const ConfirmationModal = ({ isOpen, onClose, onConfirm, title, message, confirmText = "Confirm", confirmVariant = "danger" }) => {
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title={title}>
+      <p className="text-gray-700">{message}</p>
+      <div className="flex justify-end space-x-4 mt-6">
+        <Button onClick={onClose} variant="secondary" className="w-auto">
+          Cancel
+        </Button>
+        <Button onClick={onConfirm} variant={confirmVariant} className="w-auto">
+          {confirmText}
+        </Button>
+      </div>
+    </Modal>
+  );
+};
+
+// --- Core App Components ---
+
+/**
+ * Main App Component
+ */
+export default function App() {
+  const { user, isAuthLoading } = useAuth();
+  const { leagues, isLoading: isLeaguesLoading, error: leaguesError } = useLeagues(!isAuthLoading);
+  const [selectedLeague, setSelectedLeague] = useState(null);
+  const [unlockedLeagues, setUnlockedLeagues] = useState({}); // Stores { [leagueId]: true }
+  const [leagueToUnlock, setLeagueToUnlock] = useState(null);
+  const [appError, setAppError] = useState(null);
+  const [isAdminUnlocked, setIsAdminUnlocked] = useState(false);
+  const [isSuperAdminUnlocked, setIsSuperAdminUnlocked] = useState(false); // New state for Super Admin
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
+  const [adminError, setAdminError] = useState("");
+  
+  const [username, setUsername] = useState("");
+  const [isUsernameModalOpen, setIsUsernameModalOpen] = useState(false);
+  
+  // This is the global passcode to unlock league creation
+  const GLOBAL_ADMIN_PASSCODE = "admin123";
+  // This is your personal "Super Admin" passcode
+  const GLOBAL_SUPER_ADMIN_PASSCODE = "866127634";
+  
+  const userId = user?.uid;
+
+  useEffect(() => {
+    if (leaguesError) {
+      setAppError(leaguesError);
+    }
+  }, [leaguesError]);
+
+  useEffect(() => {
+    // Load unlocked leagues from localStorage
+    try {
+      const stored = localStorage.getItem('unlockedLeagues');
+      setUnlockedLeagues(stored ? JSON.parse(stored) : {});
+    } catch (e) {
+      console.error("Failed to parse unlockedLeagues from localStorage", e);
+      setUnlockedLeagues({});
+    }
+    
+    // Check if admin is already unlocked in this session
+    try {
+      const storedAdmin = sessionStorage.getItem('isAdminUnlocked');
+      if (storedAdmin === 'true') {
+        setIsAdminUnlocked(true);
+      }
+      // Check for Super Admin
+      const storedSuperAdmin = sessionStorage.getItem('isSuperAdminUnlocked');
+      if (storedSuperAdmin === 'true') {
+        setIsSuperAdminUnlocked(true);
+      }
+    } catch (e) {
+      console.error("Failed to parse sessionStorage", e);
+    }
+    
+    // Load username from localStorage
+    try {
+      const storedUsername = localStorage.getItem('efootballUsername');
+      if (storedUsername) {
+        setUsername(storedUsername);
+      }
+    } catch (e) {
+      console.error("Failed to parse username from localStorage", e);
+    }
+  }, []);
+
+  const handleLeagueCreated = (newLeague) => {
+    // Automatically unlock the new league
+    setUnlockedLeagues(prev => {
+      const newUnlocked = { ...prev, [newLeague.id]: true };
+      localStorage.setItem('unlockedLeagues', JSON.stringify(newUnlocked));
+      return newUnlocked;
+    });
+    setSelectedLeague(newLeague);
+  };
+
+  const handleSelectLeague = (league) => {
+    // Super Admin check
+    if (isSuperAdminUnlocked) {
+      setSelectedLeague(league);
+      return;
+    }
+    
+    if (unlockedLeagues[league.id]) {
+      setSelectedLeague(league);
+    } else if (league.passcode) {
+      setLeagueToUnlock(league);
+    } else {
+      // No passcode, just open it
+      setSelectedLeague(league);
+    }
+  };
+
+  const handleUnlockLeague = (leagueId) => {
+    setUnlockedLeagues(prev => {
+      const newUnlocked = { ...prev, [leagueId]: true };
+      localStorage.setItem('unlockedLeagues', JSON.stringify(newUnlocked));
+      return newUnlocked;
+    });
+    setLeagueToUnlock(null);
+    
+    const league = leagues.find(l => l.id === leagueId);
+    setSelectedLeague(league);
+    
+    // If username isn't set, prompt for it
+    if (!username) {
+      setIsUsernameModalOpen(true);
+    }
+  };
+  
+  const handleSaveUsername = (newUsername) => {
+    if (!newUsername.trim()) return;
+    setUsername(newUsername);
+    try {
+      localStorage.setItem('efootballUsername', newUsername);
+    } catch (e) {
+      console.error("Failed to save username to localStorage", e);
+    }
+    setIsUsernameModalOpen(false);
+  };
+  
+  const handleUpdateLeague = async (leagueId, updatedData) => {
+    if (!db) {
+      setAppError("Database connection lost.");
+      return;
+    }
+    const leagueRef = doc(db, `artifacts/${appId}/public/data/leagues`, leagueId);
+    try {
+      await updateDoc(leagueRef, updatedData);
+    } catch (err) {
+      console.error("Error updating league:", err);
+      setAppError("Failed to update league. Please try again.");
+    }
+  };
+  
+  const handleGoHome = () => {
+    setSelectedLeague(null);
+    setLeagueToUnlock(null);
+  };
+
+  const handleDeleteLeague = async (leagueId) => {
+    if (!db) {
+      setAppError("Database connection lost.");
+      return;
+    }
+    // Note: This does not delete sub-collections (like chat) or Storage files.
+    // For a production app, this should be handled by a Cloud Function.
+    console.warn(`Deleting league document ${leagueId}. Associated chat messages and screenshots in Storage will not be deleted.`);
+    const leagueRef = doc(db, `artifacts/${appId}/public/data/leagues`, leagueId);
+    try {
+      await deleteDoc(leagueRef);
+      handleGoHome();
+    } catch (err) {
+      console.error("Error deleting league:", err);
+      setAppError("Failed to delete league. Please try again.");
+    }
+  };
+  
+  const handleAdminPasscodeSubmit = (passcode) => {
+    if (passcode === GLOBAL_SUPER_ADMIN_PASSCODE) {
+      // Super Admin logs in
+      setIsAdminUnlocked(true);
+      setIsSuperAdminUnlocked(true);
+      sessionStorage.setItem('isAdminUnlocked', 'true');
+      sessionStorage.setItem('isSuperAdminUnlocked', 'true');
+      setIsAdminModalOpen(false);
+      setAdminError("");
+    } else if (passcode === GLOBAL_ADMIN_PASSCODE) {
+      // Normal Admin logs in
+      setIsAdminUnlocked(true);
+      sessionStorage.setItem('isAdminUnlocked', 'true');
+      setIsAdminModalOpen(false);
+      setAdminError("");
+    } else {
+      setAdminError("Incorrect admin passcode.");
+    }
+  };
+
+  const isLoading = isAuthLoading || isLeaguesLoading;
+  const currentViewLeague = leagues.find(l => l.id === selectedLeague?.id) || selectedLeague;
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-gray-100 font-sans p-4 md:p-8">
+      <div className="max-w-7xl mx-auto space-y-8">
+        <Header onGoHome={handleGoHome} showHomeButton={!!currentViewLeague} />
+
+        {appError && (
+          <div className="bg-red-800 text-white p-4 rounded-lg shadow-lg">
+            <strong>Error:</strong> {appError}
+          </div>
+        )}
+
+        {isLoading ? (
+          <div className="text-center py-20">
+            <h2 className="text-2xl font-semibold animate-pulse">Loading Leagues...</h2>
+          </div>
+        ) : (
+          <>
+            {currentViewLeague ? (
+              <LeagueDetails 
+                league={currentViewLeague} 
+                onUpdateLeague={handleUpdateLeague}
+                onDeleteLeague={handleDeleteLeague}
+                userId={userId}
+                username={username}
+                isAdmin={isSuperAdminUnlocked} // Pass SUPER admin status
+              />
+            ) : (
+              <div className="space-y-8">
+                <LeagueSelector leagues={leagues} onSelectLeague={handleSelectLeague} />
+                
+                {isAdminUnlocked ? (
+                  <LeagueCreationPanel onLeagueCreated={handleLeagueCreated} userId={userId} />
+                ) : (
+                  <div className="bg-gray-800 p-6 rounded-lg shadow-lg text-center">
+                    <h2 className="text-xl font-bold mb-4 text-white">Admin Area</h2>
+                    <p className="text-gray-400 mb-6">Only site admins can create new leagues.</p>
+                    <Button 
+                      onClick={() => setIsAdminModalOpen(true)}
+                      className="w-auto"
+                    >
+                      Admin: Create League
+                    </Button>
+                    <p className="text-gray-500 text-sm mt-4">
+                      (The default admin passcode is: <code className="font-mono bg-gray-700 p-1 rounded">admin123</code>)
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {leagueToUnlock && (
+          <PasscodeEntryModal
+            isOpen={!!leagueToUnlock}
+            league={leagueToUnlock}
+            onUnlock={() => handleUnlockLeague(leagueToUnlock.id)}
+            onClose={() => setLeagueToUnlock(null)}
+          />
+        )}
+        
+        <AdminPasscodeModal
+          isOpen={isAdminModalOpen}
+          onClose={() => {
+            setIsAdminModalOpen(false);
+            setAdminError("");
+          }}
+          onSubmit={handleAdminPasscodeSubmit}
+          error={adminError}
+        />
+        
+        <UsernameModal
+          isOpen={isUsernameModalOpen}
+          onSave={handleSaveUsername}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Username Modal
+ */
+const UsernameModal = ({ isOpen, onSave }) => {
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!name.trim()) {
+      setError("Please enter a username.");
+      return;
+    }
+    onSave(name.trim());
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={() => {}} title="Welcome! Set Your Username" hideCloseButton={true}>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <p className="text-gray-700">
+          Please enter a username. This will be shown to others in the league chat.
+        </p>
+        <Input 
+          type="text"
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value);
+            setError("");
+          }}
+          placeholder="Your Username"
+        />
+        {error && <p className="text-red-600 text-sm">{error}</p>}
+        <Button type="submit">Save Username</Button>
+      </form>
+    </Modal>
+  );
+};
+
+
+/**
+ * Admin Passcode Modal
+ */
+const AdminPasscodeModal = ({ isOpen, onClose, onSubmit, error }) => {
+  const [passcode, setPasscode] = useState("");
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSubmit(passcode);
+  };
+  
+  const handleClose = () => {
+    setPasscode("");
+    onClose();
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={handleClose} title="Site Admin Login">
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <p className="text-gray-700">
+          Please enter the global admin passcode to create a new league.
+        </p>
+        <Input 
+          type="password"
+          value={passcode}
+          onChange={(e) => setPasscode(e.target.value)}
+          placeholder="Site Admin Passcode"
+        />
+        {error && <p className="text-red-600 text-sm">{error}</p>}
+        <Button type="submit">Unlock Admin</Button>
+      </form>
+    </Modal>
+  );
+};
+
+
+/**
+ * Passcode Entry Modal
+ */
+const PasscodeEntryModal = ({ isOpen, league, onUnlock, onClose }) => {
+  const [passcode, setPasscode] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (passcode === league.passcode) {
+      onUnlock();
+    } else {
+      setError("Incorrect passcode. Please try again.");
+    }
+  };
+  
+  const handleClose = () => {
+    setPasscode("");
+    setError("");
+    onClose();
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={handleClose} title="Passcode Required">
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <p className="text-gray-700">
+          To join the "<strong>{league.name}</strong>" league, please enter its passcode.
+        </p>
+        <Input 
+          type="password"
+          value={passcode}
+          onChange={(e) => {
+            setPasscode(e.target.value);
+            setError(""); // Clear error on new input
+          }}
+          placeholder="League Passcode"
+        />
+        {error && <p className="text-red-600 text-sm">{error}</p>}
+        <Button type="submit">Unlock League</Button>
+      </form>
+    </Modal>
+  );
+};
+
+
+/**
+ * Header
+ */
+const Header = ({ onGoHome, showHomeButton }) => (
+  <header className="flex justify-between items-center">
+    <h1 className="text-3xl md:text-4xl font-extrabold text-white">
+      <span className="text-blue-400">eFootball</span> League Hub
+    </h1>
+    {showHomeButton && (
+      <button 
+        onClick={onGoHome}
+        className="bg-gray-700 text-white font-bold py-2 px-4 rounded-lg transition-all duration-300 ease-in-out hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500"
+      >
+        All Leagues
+      </button>
+    )}
+  </header>
+);
+
+/**
+ * League Selector
+ */
+const LeagueSelector = ({ leagues, onSelectLeague }) => {
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const filteredLeagues = useMemo(() => {
+    if (!searchTerm) return leagues;
+    return leagues.filter(league => 
+      league.name.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+  }, [leagues, searchTerm]);
+
+  return (
+    <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+      <h2 className="text-2xl font-bold mb-6 text-white">Join a League</h2>
+      
+      <Input
+        value={searchTerm}
+        onChange={(e) => setSearchTerm(e.target.value)}
+        placeholder="Search leagues by name..."
+        type="search"
+      />
+
+      {leagues.length === 0 && (
+        <div className="text-center py-6">
+          <p className="text-gray-400">No leagues found. Be the first to create one below!</p>
+        </div>
+      )}
+      
+      {leagues.length > 0 && filteredLeagues.length === 0 && (
+        <div className="text-center py-6">
+          <p className="text-gray-400">No leagues found matching your search.</p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
+        {filteredLeagues.map(league => (
+          <button
+            key={league.id}
+            onClick={() => onSelectLeague(league)}
+            className="block p-6 bg-gray-700 rounded-lg shadow-md hover:bg-gray-600 transition-all duration-300 text-left w-full"
+          >
+            <h3 
+              className="text-xl font-semibold truncate"
+              style={{ color: generateColorForString(league.name, 'darkBg') }}
+              title={league.name}
+            >
+              {league.name}
+            </h3>
+            <p className="text-gray-400 mt-2">{league.teams?.length || 0} Teams</p>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+/**
+ * League Creation Panel
+ */
+const LeagueCreationPanel = ({ onLeagueCreated, userId }) => {
+  const [name, setName] = useState("");
+  const [passcode, setPasscode] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!name.trim() || !passcode.trim()) {
+      setError("League name and passcode are required.");
+      return;
+    }
+    if (!userId || !db) {
+      setError("Not authenticated. Please refresh.");
+      return;
+    }
+
+    setIsLoading(true);
+    setError("");
+    
+    const newLeague = {
+      name: name,
+      passcode: passcode,
+      createdBy: userId,
+      createdAt: new Date().toISOString(),
+      teams: [],
+      fixtures: [],
+      table: [],
+    };
+
+    try {
+      const docRef = await addDoc(collection(db, `artifacts/${appId}/public/data/leagues`), newLeague);
+      setName("");
+      setPasscode("");
+      onLeagueCreated({ id: docRef.id, ...newLeague });
+    } catch (err) {
+      console.error("Error creating league:", err);
+      setError("Failed to create league. Please try again.");
+    }
+    setIsLoading(false);
+  };
+
+  return (
+    <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+      <h2 className="text-2xl font-bold mb-6 text-white">Create New League</h2>
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <Input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="League Name (e.g., 'Winter Season')"
+        />
+        <Input
+          type="password"
+          value={passcode}
+          onChange={(e) => setPasscode(e.target.value)}
+          placeholder="League Passcode (This is the key for members)"
+        />
+        {error && <p className="text-red-400 text-sm">{error}</p>}
+        <Button type="submit" disabled={isLoading}>
+          {isLoading ? "Creating..." : "Create League"}
+        </Button>
+      </form>
+    </div>
+  );
+};
+
+/**
+ * League Details View
+ */
+const LeagueDetails = ({ league, onUpdateLeague, onDeleteLeague, userId, username, isAdmin }) => {
+  const [activeTab, setActiveTab] = useState('table');
+
+  const pendingFixtures = useMemo(() => league.fixtures.filter(f => f.status === 'pending'), [league.fixtures]);
+  const completedFixtures = useMemo(() => league.fixtures.filter(f => f.status === 'completed'), [league.fixtures]);
+
+  const isLeagueAdmin = (league.createdBy === userId || isAdmin); // Permission check (now uses Super Admin)
+
+  return (
+    <div className="space-y-8">
+      <div className="text-center">
+        <h2 
+          className="text-3xl font-bold"
+          style={{ color: generateColorForString(league.name, 'darkBg') }}
+        >
+          {league.name}
+        </h2>
+        <p className="text-gray-400">Passcode: <span className="font-mono bg-gray-700 px-2 py-1 rounded-md">{league.passcode}</span></p>
+      </div>
+      
+      {/* Tab Navigation */}
+      <div className="flex items-center justify-center flex-wrap gap-2 bg-gray-800 p-2 rounded-lg">
+        <TabButton name="League Table" activeTab={activeTab} setActiveTab={() => setActiveTab('table')} />
+        <TabButton name="Fixtures" activeTab={activeTab} setActiveTab={() => setActiveTab('fixtures')} />
+        <TabButton name="Chat" activeTab={activeTab} setActiveTab={() => setActiveTab('chat')} />
+        {isLeagueAdmin && ( // Conditionally render Admin tab
+          <TabButton name="Admin" activeTab={activeTab} setActiveTab={() => setActiveTab('admin')} />
+        )}
+      </div>
+
+      {/* Tab Content */}
+      <div>
+        {activeTab === 'table' && <LeagueTable table={league.table} />}
+        {activeTab === 'fixtures' && (
+          <FixturesPanel 
+            league={league}
+            onUpdateLeague={onUpdateLeague}
+            pendingFixtures={pendingFixtures}
+            completedFixtures={completedFixtures}
+          />
+        )}
+        {activeTab === 'chat' && (
+          <ChatPanel 
+            leagueId={league.id}
+            userId={userId}
+            username={username}
+          />
+        )}
+        {isLeagueAdmin && activeTab === 'admin' && ( // Conditionally render Admin panel
+          <AdminPanel 
+            league={league}
+            onUpdateLeague={onUpdateLeague}
+            onDeleteLeague={onDeleteLeague}
+          />
+        )}
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Tab Button
+ */
+const TabButton = ({ name, activeTab, setActiveTab }) => (
+  <button
+    onClick={setActiveTab}
+    className={`py-3 px-4 md:px-6 font-semibold rounded-md transition-all duration-300 ${
+      activeTab === name.toLowerCase().split(' ')[0]
+        ? 'bg-blue-600 text-white shadow-lg'
+        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+    }`}
+  >
+    {name}
+  </button>
+);
+
+
+/**
+ * League Table Panel
+ */
+const LeagueTable = ({ table }) => {
+  if (table.length === 0) {
+    return (
+      <div className="bg-gray-800 rounded-lg shadow-lg p-8 text-center">
+        <h3 className="text-xl font-semibold text-white">League Table is Empty</h3>
+        <p className="text-gray-400 mt-2">Add teams and generate fixtures in the 'Admin' tab to get started.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-800 rounded-lg shadow-lg overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-white">
+          <thead className="bg-gray-700">
+            <tr>
+              <th className="py-3 px-2 md:px-4 text-left text-xs font-semibold uppercase tracking-wider w-1/12">#</th>
+              <th className="py-3 px-2 md:px-4 text-left text-xs font-semibold uppercase tracking-wider w-4/12">Team</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">P</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">W</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">D</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">L</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">GD</th>
+              <th className="py-3 px-2 md:px-4 text-center text-xs font-semibold uppercase tracking-wider">Pts</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-700">
+            {table.map((team, index) => (
+              <tr key={team.name} className="hover:bg-gray-700">
+                <td className="py-4 px-2 md:px-4 text-sm font-medium">{index + 1}</td>
+                <td 
+                  className="py-4 px-2 md:px-4 text-sm font-bold truncate"
+                  style={{ color: generateColorForString(team.name, 'darkBg') }}
+                  title={team.name}
+                >
+                  {team.name}
+                </td>
+                <td className="py-4 px-2 md:px-4 text-sm text-center">{team.P}</td>
+                <td className="py-4 px-2 md:px-4 text-sm text-center">{team.W}</td>
+                <td className="py-4 px-2 md:px-4 text-sm text-center">{team.D}</td>
+                <td className="py-4 px-2 md:px-4 text-sm text-center">{team.L}</td>
+                <td className="py-4 px-2 md:px-4 text-sm text-center">{team.GD}</td>
+                <td className="py-4 px-2 md:px-4 text-sm font-bold text-center">{team.Pts}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Admin Panel
+ */
+const AdminPanel = ({ league, onUpdateLeague, onDeleteLeague }) => {
+  const [teamName, setTeamName] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+
+  const handleAddTeam = async (e) => {
+    e.preventDefault();
+    if (!teamName.trim()) {
+      setError("Team name cannot be empty.");
+      return;
+    }
+    if (league.teams.includes(teamName.trim())) {
+      setError("This team name already exists.");
+      return;
+    }
+
+    setIsLoading(true);
+    setError("");
+    const newTeams = [...league.teams, teamName.trim()];
+    
+    try {
+      await onUpdateLeague(league.id, { teams: newTeams });
+      setTeamName("");
+    } catch (err) {
+      setError("Failed to add team.");
+    }
+    setIsLoading(false);
+  };
+
+  const handleGenerateFixtures = async () => {
+    if (league.teams.length < 2) {
+      setError("You need at least 2 teams to generate fixtures.");
+      return;
+    }
+    if (league.fixtures.length > 0) {
+      // Use a custom modal instead of window.confirm
+      // For simplicity, we'll skip the confirmation for now.
+      // A better UX would use the ConfirmationModal.
+      console.log("Replacing existing fixtures.");
+    }
+
+    setIsLoading(true);
+    setError("");
+    const newFixtures = generateFixtures(league.teams);
+    const newTable = calculateLeagueTable(league.teams, []); // Reset table
+    
+    try {
+      await onUpdateLeague(league.id, { fixtures: newFixtures, table: newTable });
+    } catch (err) {
+      setError("Failed to generate fixtures.");
+    }
+    setIsLoading(false);
+  };
+  
+  const confirmDelete = () => {
+    onDeleteLeague(league.id);
+    setIsDeleteModalOpen(false);
+  };
+
+  return (
+    <>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {/* Add Team Section */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+          <h3 className="text-xl font-bold mb-4">Manage Teams</h3>
+          <form onSubmit={handleAddTeam} className="space-y-3">
+            <Input
+              value={teamName}
+              onChange={(e) => setTeamName(e.target.value)}
+              placeholder="New Team Name"
+            />
+            <Button type="submit" disabled={isLoading}>
+              {isLoading ? "Adding..." : "Add Team"}
+            </Button>
+          </form>
+          {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
+          
+          <h4 className="text-lg font-semibold mt-6 mb-3">Current Teams ({league.teams.length})</h4>
+          <ul className="mt-6 space-y-2 max-h-60 overflow-y-auto">
+            {league.teams.map(team => (
+              <li 
+                key={team} 
+                className="bg-gray-700 p-3 rounded-md font-semibold truncate"
+                style={{ color: generateColorForString(team.name, 'darkBg') }}
+                title={team}
+              >
+                {team}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {/* Generate Fixtures Section */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-6">
+          <div>
+            <h3 className="text-xl font-bold mb-4">Manage Fixtures</h3>
+            <p className="text-gray-400 mb-4">Generates a round-robin schedule for all teams. Re-running this will replace all fixtures.</p>
+            <Button onClick={handleGenerateFixtures} disabled={isLoading}>
+              {isLoading ? "Generating..." : "Generate Fixtures"}
+            </Button>
+          </div>
+          
+          {/* Delete League Section */}
+          <div>
+            <h3 className="text-xl font-bold mb-4 text-red-400">Danger Zone</h3>
+            <p className="text-gray-400 mb-4">Permanently delete this league. This action cannot be undone.</p>
+            <Button onClick={() => setIsDeleteModalOpen(true)} variant="danger">
+              Delete League
+            </Button>
+          </div>
+        </div>
+      </div>
+      
+      <ConfirmationModal
+        isOpen={isDeleteModalOpen}
+        onClose={() => setIsDeleteModalOpen(false)}
+        onConfirm={confirmDelete}
+        title="Delete League?"
+        message={`Are you sure you want to permanently delete the league "${league.name}"? All teams, fixtures, and chat history will be lost.`}
+        confirmText="Yes, Delete"
+        confirmVariant="danger"
+      />
+    </>
+  );
+};
+
+/**
+ * Fixtures Panel
+ */
+const FixturesPanel = ({ league, onUpdateLeague, pendingFixtures, completedFixtures }) => {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [selectedFixture, setSelectedFixture] = useState(null);
+
+  // Group pending fixtures by label
+  const groupedPendingFixtures = useMemo(() => {
+    const groups = pendingFixtures.reduce((acc, fixture) => {
+      const label = fixture.label || "Unlabelled";
+      if (!acc[label]) {
+        acc[label] = [];
+      }
+      acc[label].push(fixture);
+      return acc;
+    }, {});
+    return groups;
+  }, [pendingFixtures]);
+
+  // Get sorted group labels, putting "Unlabelled" last
+  const pendingGroupLabels = useMemo(() => {
+    return Object.keys(groupedPendingFixtures).sort((a, b) => {
+      if (a === "Unlabelled") return 1;
+      if (b === "Unlabelled") return -1;
+      return a.localeCompare(b);
+    });
+  }, [groupedPendingFixtures]);
+
+
+  const openModal = (fixture) => {
+    setSelectedFixture(fixture);
+    setModalOpen(true);
+  };
+
+  const closeModal = () => {
+    setModalOpen(false);
+    setSelectedFixture(null);
+  };
+
+  const handleSaveScore = async (updatedFixture) => {
+    const newFixtures = league.fixtures.map(f =>
+      (f.home === updatedFixture.home && f.away === updatedFixture.away) ? updatedFixture : f
+    );
+    
+    // Recalculate table
+    const newTable = calculateLeagueTable(league.teams, newFixtures);
+    
+    try {
+      await onUpdateLeague(league.id, { fixtures: newFixtures, table: newTable });
+      closeModal();
+    } catch (err) {
+      console.error("Failed to save score:", err);
+      // We can show an error in the modal
+    }
+  };
+  
+  // Save only details (label, condition) without completing the match
+  const handleSaveLabel = async (updatedFixture) => {
+    const newFixtures = league.fixtures.map(f =>
+      (f.home === updatedFixture.home && f.away === updatedFixture.away) ? updatedFixture : f
+    );
+    
+    // We DON'T recalculate the table, as no score changed
+    try {
+      await onUpdateLeague(league.id, { fixtures: newFixtures });
+      closeModal();
+    } catch (err) {
+      console.error("Failed to save label:", err);
+      // This error should be propagated to the modal
+      throw err;
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+      {/* Pending Fixtures */}
+      <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+        <h3 className="text-xl font-bold mb-4">Pending Fixtures ({pendingFixtures.length})</h3>
+        <div className="space-y-3 max-h-96 overflow-y-auto">
+          {pendingFixtures.length > 0 ? (
+            pendingGroupLabels.map(label => (
+              <div key={label}>
+                <h4 className="text-lg font-semibold text-yellow-300 mt-4 mb-2 sticky top-0 bg-gray-800 py-1 px-1">
+                  {label}
+                </h4>
+                <div className="space-y-3">
+                  {groupedPendingFixtures[label].map((fixture, index) => (
+                    <FixtureItem 
+                      key={index} 
+                      fixture={fixture} 
+                      onClick={() => openModal(fixture)}
+                      isPending={true} 
+                    />
+                  ))}
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="text-gray-400">No pending fixtures.</p>
+          )}
+        </div>
+      </div>
+
+      {/* Completed Results */}
+      <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+        <h3 className="text-xl font-bold mb-4">Completed Results ({completedFixtures.length})</h3>
+        <div className="space-y-3 max-h-96 overflow-y-auto">
+          {completedFixtures.length > 0 ? (
+            completedFixtures.map((fixture, index) => (
+              <FixtureItem 
+                key={index} 
+                fixture={fixture} 
+                onClick={() => openModal(fixture)} // Allow clicking completed to see details
+                isPending={false} 
+              />
+            ))
+          ) : (
+            <p className="text-gray-400">No results yet.</p>
+          )}
+        </div>
+      </div>
+
+      {modalOpen && selectedFixture && (
+        <ScoreEntryModal
+          isOpen={modalOpen}
+          onClose={closeModal}
+          fixture={selectedFixture}
+          onSave={handleSaveScore}
+          onSaveLabel={handleSaveLabel} // Pass the new handler
+          leagueId={league.id}
+        />
+      )}
+    </div>
+  );
+};
+
+const FixtureItem = ({ fixture, onClick, isPending }) => {
+  let homeScoreColor = "text-white";
+  let awayScoreColor = "text-white";
+
+  if (!isPending) {
+    if (fixture.homeScore > fixture.awayScore) {
+      homeScoreColor = "text-green-400 font-bold";
+      awayScoreColor = "text-red-400";
+    } else if (fixture.homeScore < fixture.awayScore) {
+      homeScoreColor = "text-red-400";
+      awayScoreColor = "text-green-400 font-bold";
+    }
+  }
+
+  return (
+    <div 
+      onClick={onClick}
+      className={`bg-gray-700 p-4 rounded-lg flex items-center justify-between relative ${isPending ? 'cursor-pointer hover:bg-gray-600' : 'cursor-pointer hover:bg-gray-600'}`} // Always clickable
+    >
+      <span 
+        className="text-right font-bold w-2/5 truncate" 
+        title={fixture.home}
+        style={{ color: generateColorForString(fixture.home, 'darkBg') }}
+      >
+        {fixture.home}
+      </span>
+      
+      {isPending ? (
+        <span className="text-sm font-mono text-gray-400 w-1/5 text-center">VS</span>
+      ) : (
+        <span className="text-xl font-bold w-1/5 text-center">
+          <span className={homeScoreColor}>{fixture.homeScore}</span>
+          <span className="text-white mx-1">-</span>
+          <span className={awayScoreColor}>{fixture.awayScore}</span>
+        </span>
+      )}
+      
+      <span 
+        className="text-left font-bold w-2/5 truncate" 
+        title={fixture.away}
+        style={{ color: generateColorForString(fixture.away, 'darkBg') }}
+      >
+        {fixture.away}
+      </span>
+      
+      <div className="absolute right-4 top-2 text-xs text-gray-400 space-y-1 text-right">
+        {/* Show label if it exists (only on completed fixtures now) */}
+        {fixture.label && !isPending && (
+          <span className="block font-semibold text-yellow-300">{fixture.label}</span>
+        )}
+        {!isPending && (
+          <span className="block">{fixture.condition}</span>
+        )}
+        {!isPending && fixture.screenshotURL && (
+          <a 
+            href={fixture.screenshotURL} 
+            target="_blank" 
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()} 
+            className="block text-blue-400 hover:text-blue-300 font-semibold"
+          >
+            View Screenshot
+          </a>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
+/**
+ * Score Entry Modal
+ */
+const ScoreEntryModal = ({ isOpen, onClose, fixture, onSave, onSaveLabel, leagueId }) => {
+  const [homeScore, setHomeScore] = useState(fixture.homeScore || "");
+  const [awayScore, setAwayScore] = useState(fixture.awayScore || "");
+  const [condition, setCondition] = useState(fixture.condition || "Excellent");
+  const [label, setLabel] = useState(fixture.label || ""); // State for the label
+  const [screenshot, setScreenshot] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  
+  const isPending = fixture.status === 'pending';
+
+  const handleFileDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      setScreenshot(e.dataTransfer.files[0]);
+    }
+  };
+  
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setScreenshot(e.target.files[0]);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const uploadScreenshot = async () => {
+    if (!screenshot || !storage) {
+      return null; // No new screenshot to upload
+    }
+    
+    const screenshotRef = ref(storage, `artifacts/${appId}/public/screenshots/${leagueId}/${Date.now()}_${screenshot.name}`);
+    
+    try {
+      const snapshot = await uploadBytes(screenshotRef, screenshot);
+      const downloadURL = await getDownloadURL(snapshot.ref);
+      return downloadURL;
+    } catch (err) {
+      console.error("Upload failed:", err);
+      throw new Error("Failed to upload screenshot.");
+    }
+  };
+
+  const handleSaveClick = async () => {
+    if (homeScore === "" || awayScore === "") {
+      setUploadError("Please enter both scores to save a final result.");
+      return;
+    }
+    
+    setIsUploading(true);
+    setUploadError("");
+    
+    try {
+      let screenshotURL = fixture.screenshotURL; // Keep old one if not updated
+      if (screenshot) {
+        screenshotURL = await uploadScreenshot();
+      }
+      
+      const updatedFixture = {
+        ...fixture,
+        homeScore: parseInt(homeScore, 10),
+        awayScore: parseInt(awayScore, 10),
+        condition: condition,
+        label: label, // Save the label
+        screenshotURL: screenshotURL,
+        status: 'completed',
+      };
+      
+      onSave(updatedFixture);
+      
+    } catch (err) {
+      setUploadError(err.message || "Failed to save result.");
+    }
+    
+    setIsUploading(false);
+  };
+  
+  // Handle saving only label/condition
+  const handleSaveLabelClick = async () => {
+    setIsUploading(true);
+    setUploadError("");
+    
+    try {
+      // Only update label and condition, keep scores and status as they were
+      const updatedFixture = {
+        ...fixture,
+        condition: condition,
+        label: label,
+      };
+      
+      await onSaveLabel(updatedFixture);
+      
+    } catch (err) {
+      setUploadError(err.message || "Failed to save details.");
+    }
+    setIsUploading(false);
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title="Match Details">
+      <div className="space-y-6">
+        <div className="flex justify-around items-center text-center">
+          <div className="w-2/5">
+            <label 
+              className="block text-sm font-bold mb-2 truncate" 
+              title={fixture.home}
+              style={{ color: generateColorForString(fixture.home, 'lightBg') }}
+            >
+              {fixture.home}
+            </label>
+            <Input 
+              type="number"
+              value={homeScore}
+              onChange={(e) => setHomeScore(e.target.value)}
+              placeholder="0"
+              disabled={!isPending} // Disable if already completed
+            />
+          </div>
+          <span className="text-2xl font-bold text-gray-500">-</span>
+          <div className="w-2/5">
+            <label 
+              className="block text-sm font-bold mb-2 truncate" 
+              title={fixture.away}
+              style={{ color: generateColorForString(fixture.away, 'lightBg') }}
+            >
+              {fixture.away}
+            </label>
+            <Input 
+              type="number"
+              value={awayScore}
+              onChange={(e) => setAwayScore(e.target.value)}
+              placeholder="0"
+              disabled={!isPending} // Disable if already completed
+            />
+          </div>
+        </div>
+        
+        {/* Fixture Label */}
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">Fixture Label</label>
+          <Input 
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="e.g., Monday, Matchday 1"
+          />
+        </div>
+        
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">Match Condition</label>
+          <select
+            value={condition}
+            onChange={(e) => setCondition(e.target.value)}
+            className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all bg-white text-gray-900"
+          >
+            <option>Excellent</option>
+            <option>Good</option>
+            <option>Average</option>
+            <option>Poor</option>
+          </select>
+        </div>
+        
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">Result Screenshot (Optional)</label>
+          <div 
+            className="border-2 border-dashed border-gray-400 rounded-lg p-8 text-center cursor-pointer hover:border-blue-500 transition-all"
+            onDrop={handleFileDrop}
+            onDragOver={handleDragOver}
+            onClick={() => document.getElementById('fileUpload').click()}
+          >
+            <input 
+              type="file" 
+              id="fileUpload" 
+              className="hidden" 
+              accept="image/*"
+              onChange={handleFileChange}
+            />
+            {screenshot ? (
+              <p className="text-green-600 font-semibold">{screenshot.name}</p>
+            ) : (
+              <p className="text-gray-500">Drag & drop or click to upload</p>
+            )}
+          </div>
+          {fixture.screenshotURL && !screenshot && (
+            <div className="text-center mt-2">
+              <a 
+                href={fixture.screenshotURL} 
+                target="_blank" 
+                rel="noopener noreferrer" 
+                className="text-blue-600 hover:underline"
+              >
+                View current screenshot
+              </a>
+            </div>
+          )}
+        </div>
+        
+        {uploadError && <p className="text-red-500 text-sm">{uploadError}</p>}
+        
+        <div className="space-y-3">
+          {/* Only show "Save FINAL Result" for pending matches */}
+          {isPending && (
+            <Button onClick={handleSaveClick} disabled={isUploading}>
+              {isUploading ? "Saving..." : "Save FINAL Result"}
+            </Button>
+          )}
+          <Button onClick={handleSaveLabelClick} disabled={isUploading} variant="secondary">
+            {isUploading ? "Saving..." : "Save Details Only"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/**
+ * Chat Panel
+ */
+const ChatPanel = ({ leagueId, userId, username }) => {
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const messagesEndRef = React.useRef(null);
+
+  const messagesCollectionPath = `artifacts/${appId}/public/data/leagues/${leagueId}/messages`;
+
+  // Scroll to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // Listen for new messages
+  useEffect(() => {
+    if (!db) {
+      setError("Database connection lost.");
+      setIsLoading(false);
+      return;
+    }
+    
+    setIsLoading(true);
+    const q = query(collection(db, messagesCollectionPath), orderBy("createdAt"));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const msgs = [];
+      snapshot.forEach(doc => {
+        msgs.push({ id: doc.id, ...doc.data() });
+      });
+      setMessages(msgs);
+      setIsLoading(false);
+    }, (err) => {
+      console.error("Error fetching messages:", err);
+      setError("Failed to load chat. Please try again.");
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [leagueId]);
+
+  const handleSendMessage = async (e) => {
+    e.preventDefault();
+    if (!newMessage.trim() || !userId || !db) {
+      return;
+    }
+
+    const msg = newMessage;
+    setNewMessage("");
+
+    // Use the passed username, or a fallback
+    const senderName = username || `User ${userId.substring(0, 6)}`;
+
+    try {
+      await addDoc(collection(db, messagesCollectionPath), {
+        text: msg,
+        senderId: userId,
+        username: senderName, // Add username to the message
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("Error sending message:", err);
+      setError("Failed to send message.");
+      // If failed, put the message back in the input
+      setNewMessage(msg);
+    }
+  };
+
+  return (
+    <div className="bg-gray-800 rounded-lg shadow-lg p-6 flex flex-col" style={{height: '70vh'}}>
+      <h3 className="text-xl font-bold mb-4">League Chat</h3>
+      {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
+      
+      <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+        {isLoading && <p className="text-gray-400 text-center">Loading chat...</p>}
+        {!isLoading && messages.length === 0 && (
+          <p className="text-gray-400 text-center">No messages yet. Say hello!</p>
+        )}
+        {messages.map(msg => {
+          const isCurrentUser = msg.senderId === userId;
+          // Use the username from the message, with a fallback
+          const senderName = msg.username || `User ${msg.senderId ? msg.senderId.substring(0, 6) : '??'}`;
+          
+          return (
+            <div 
+              key={msg.id} 
+              className={`flex ${isCurrentUser ? 'justify-end' : 'justify-start'}`}
+            >
+              <div 
+                className={`p-3 rounded-lg max-w-xs md:max-w-md ${
+                  isCurrentUser 
+                    ? 'bg-blue-600 text-white' 
+                    : 'bg-gray-700 text-gray-200'
+                }`}
+              >
+                <p className="text-xs opacity-75 mb-1" style={{color: isCurrentUser ? 'white' : generateColorForString(senderName, 'darkBg')}}>
+                  {isCurrentUser ? 'You' : senderName}
+                </p>
+                <p className="break-words">{msg.text}</p>
+              </div>
+            </div>
+          );
+        })}
+        <div ref={messagesEndRef} />
+      </div>
+      
+      <form onSubmit={handleSendMessage} className="mt-4 flex space-x-3">
+        <Input 
+          value={newMessage}
+          onChange={(e) => setNewMessage(e.target.value)}
+          placeholder="Type your message..."
+        />
+        <Button type="submit" className="w-auto px-8" disabled={!username}>
+          {username ? "Send" : "Set Username"}
+        </Button>
+      </form>
+    </div>
+  );
+};
+
